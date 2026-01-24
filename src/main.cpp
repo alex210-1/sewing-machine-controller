@@ -11,12 +11,13 @@
 #define ENCODER_PULSES 1000
 #define ENCODER_TICK (F_CPU / 8)
 
-volatile float Kp = 0;
+volatile float Kp = 10;
 volatile float Ki = 0;
 volatile float Li = Ki * 1; // Integral limit
 
 volatile uint16_t smooth_encoder_count = 0;
 volatile float target_rps_sync = 0;
+volatile float current_rps_sync = 0;
 volatile byte isr_time_usage = 0;
 
 void setup()
@@ -28,24 +29,28 @@ void setup()
     pinMode(INPUT, DIAL_PIN);
     pinMode(INPUT, ENCODER_PIN);
     pinMode(OUTPUT, PWM_PIN);
+    DDRB |= (1 << PB3); // pin 11 COM1A output
 
     // === setup enocoder timer ===
     attachInterrupt(INT0, ENCODER_ISR, RISING); // attach encoder interrupt
-    TCCR1B |= 0x02 << CS10;                     // set clock prescaler to 8. This starts the timer.
+    // reset timer registers, the arduino library seems to be setting it's own defaults!!!
+    TCCR1A = 0x00;
+    TCCR1B = 0x02 << CS10; // set clock prescaler to 8. This starts the timer.
+    TCCR1C = 0x00;
 
     // === set up PWM timer ===
-    TCCR2A |= 0x03 << WGM20; // set waveform generation mode to Fast PWM (full)
-    TCCR2B |= 0x03 << CS20;  // set clock prescaler to 32. This starts the timer.
-    TIMSK2 |= 1 << TOIE2;    // enable timer 2 overflow interrupt
+    TCCR2A = 0x03 << WGM20; // set waveform generation mode to Fast PWM (full)
+    TCCR2B = 0x03 << CS20;  // set clock prescaler to 32. This starts the timer.
+    TIMSK2 = 1 << TOIE2;    // enable timer 2 overflow interrupt
 
     // set noninverting PWM output active on OC2A pin.
     // Nothing should happen until value is written to OCR2A, though
-    TCCR2A |= 1 << COM2A1;
+    TCCR2A |= 0x02 << COM2A0;
 }
 
 void loop()
 {
-    float target_rps = calc_target_speed();
+    float target_rps = calc_dummy_speed();
 
     cli();
     target_rps_sync = target_rps; // keep calculation out of critical section
@@ -53,10 +58,11 @@ void loop()
 
 #ifdef DEBUG
     // Log state
+    Serial.println();
     Serial.print(">target_rps:");
     Serial.println(target_rps);
-    Serial.print(">smooth_encoder_count:");
-    Serial.println(smooth_encoder_count);
+    Serial.print(">current_rps:");
+    Serial.println(current_rps_sync);
     Serial.print(">PWM:");
     Serial.println(OCR2A);
     Serial.print(">isr_time_usage:");
@@ -84,6 +90,8 @@ void loop()
             Serial.println("Unknown command");
         }
     }
+
+    // delay(500);
 #endif
 }
 
@@ -96,6 +104,7 @@ inline float clampf(float x, float min, float max)
     return x;
 }
 
+// TODO timer overflow ISR
 void ENCODER_ISR()
 {
     // CPU automatically clears global interrupt enable (and reenables afterwards).
@@ -103,8 +112,11 @@ void ENCODER_ISR()
     // This interrupt is sensitive to timing jitter,
     // so critical sections everywhere else need to be short.
 
-    uint16_t encoder_time = TCNT1; // compiler takes care of atomic access here TODO verify
-    TCNT1 = 0;                     // reset timer
+    // Datasheet says compiler handles 16-bit access here
+    uint16_t encoder_time = TCNT1;
+    TCNT1 = 0; // reset timer
+
+    // TODO use TOV1 flag for overflow detection
 
     // do some primitive exponential smoothing to filter out potential glitches and jitter.
     // prevent overflow. The compiler optimizes this nicely
@@ -138,5 +150,6 @@ ISR(TIMER2_OVF_vect)
     // and the write will be applied on the next cycle of the timer
     cli(); // disable interrupts for atomic access
     OCR2A = u_int;
+    current_rps_sync = current_rps;
     isr_time_usage = TCNT2; // monitor timing headroom
 }
