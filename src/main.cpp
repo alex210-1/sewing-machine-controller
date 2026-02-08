@@ -2,18 +2,17 @@
 #include "main.h"
 #include "input.h"
 
-#define DEBUG
-
 #define ENCODER_PIN 2 // INT0 pin
 #define PWM_PIN 11    // OC2A pin
 
-#define F_PWM (F_CPU / (256 * 32))
+#define F_CTRL (F_CPU / (256 * 64))
+#define F_PWM (F_CPU / (256 * 8))
 #define ENCODER_PULSES 1000
 #define ENCODER_TICK (F_CPU / 8)
 
-volatile float Kp = 10;
-volatile float Ki = 0;
-volatile float Li = Ki * 1; // Integral limit
+#define Kp 20
+#define Ki 0
+#define Li (Ki * 1)
 
 volatile uint16_t smooth_encoder_count = 0;
 volatile float target_rps_sync = 0;
@@ -40,7 +39,7 @@ void setup()
 
     // === set up PWM timer ===
     TCCR2A = 0x03 << WGM20; // set waveform generation mode to Fast PWM (full)
-    TCCR2B = 0x03 << CS20;  // set clock prescaler to 32. This starts the timer.
+    TCCR2B = 0x02 << CS20;  // set clock prescaler to 8. This starts the timer.
     TIMSK2 = 1 << TOIE2;    // enable timer 2 overflow interrupt
 
     // set noninverting PWM output active on OC2A pin.
@@ -50,13 +49,12 @@ void setup()
 
 void loop()
 {
-    float target_rps = calc_dummy_speed();
+    float target_rps = calc_target_speed();
 
     cli();
     target_rps_sync = target_rps; // keep calculation out of critical section
     sei();
 
-#ifdef DEBUG
     // Log state
     Serial.println();
     Serial.print(">target_rps:");
@@ -67,32 +65,6 @@ void loop()
     Serial.println(OCR2A);
     Serial.print(">isr_time_usage:");
     Serial.println(isr_time_usage);
-
-    // parameter tuning
-    if (Serial.available())
-    {
-        char cmd = Serial.read();
-        if (cmd == 'P')
-        {
-            // Writing these non-atomic should be "good enough" for tuning.
-            Kp = Serial.parseFloat();
-        }
-        else if (cmd == 'I')
-        {
-            Ki = Serial.parseFloat();
-        }
-        else if (cmd == 'L')
-        {
-            Li = Serial.parseFloat();
-        }
-        else
-        {
-            Serial.println("Unknown command");
-        }
-    }
-
-    // delay(500);
-#endif
 }
 
 inline float clampf(float x, float min, float max)
@@ -123,12 +95,20 @@ void ENCODER_ISR()
     smooth_encoder_count = (uint16_t)(((uint32_t)smooth_encoder_count + encoder_time) / 2);
 }
 
-// PWM (Timer 2): PI control loop
+// PWM (Timer 0): PI control loop
 // make this ISR preemptable by setting the interrupt enable flag.
 // this should reduce jitter for the encoder ISR.
 ISR(TIMER2_OVF_vect)
 {
-    static float u_i = 0; // integral part
+    // limit control loop frequency
+    static int limiter = 0;
+
+    if (limiter++ < 8)
+        return;
+
+    limiter = 0;
+
+    // static float u_i = 0; // integral part
 
     float target_rps = target_rps_sync;
     uint16_t current_encoder_count = smooth_encoder_count;
@@ -138,12 +118,12 @@ ISR(TIMER2_OVF_vect)
     float current_rps = (ENCODER_TICK / ENCODER_PULSES) / current_encoder_count;
 
     float e = target_rps - current_rps;
-    u_i += (e * Ki) / F_PWM;
+    // u_i += (e * Ki) / F_CTRL;
 
     // windup prevention by clamping integrand
-    u_i = clampf(u_i, -Li, Li);
+    // u_i = clampf(u_i, -Li, Li);
 
-    float u = e * Kp + u_i;
+    float u = e * Kp; // + u_i;
     byte u_int = (byte)clampf(u, 0, 0xFF);
 
     // set pwm comparator value. This register is double buffered
